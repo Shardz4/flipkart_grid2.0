@@ -488,7 +488,7 @@ def generate_submission(
     )
 
     sub.to_csv(OUT_PATH, index=False)
-    print(f"\n✅  Submission saved → {OUT_PATH}")
+    print(f"\n[OK]  Submission saved -> {OUT_PATH}")
     print(f"   Rows: {len(sub):,}  |  Columns: {list(sub.columns)}")
     print(f"   demand  min={sub['demand'].min():.6f}  "
           f"max={sub['demand'].max():.6f}  "
@@ -570,7 +570,7 @@ def main():
     generate_submission(lgb_model, cb_model, alpha, test, feature_cols, sample_sub)
 
     elapsed = time.time() - t0
-    print(f"\n🏁  Pipeline completed in {elapsed / 60:.1f} minutes.")
+    print(f"\n[DONE]  Pipeline completed in {elapsed / 60:.1f} minutes.")
 
 
 if __name__ == "__main__":
