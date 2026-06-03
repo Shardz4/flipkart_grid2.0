@@ -40,7 +40,7 @@ def decode_geohash_column(df: pd.DataFrame) -> pd.DataFrame:
     the centre of a rectangular cell on Earth — this gives the model
     continuous spatial coordinates it can split on.
     """
-    import Geohash as gh  # python-geohash exposes this name
+    import geohash as gh  # python-geohash
 
     # Vectorised via apply — fast enough for <120 k rows
     decoded = df["geohash"].apply(lambda h: gh.decode(h))
@@ -410,6 +410,7 @@ def train_catboost(
         learning_rate=0.03,
         depth=6,
         l2_leaf_reg=3.0,
+        bootstrap_type="Bernoulli",     # ← required to use subsample
         subsample=0.8,                  # row subsampling
         colsample_bylevel=0.7,          # feature subsampling per level
         min_data_in_leaf=30,
