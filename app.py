@@ -103,42 +103,7 @@ def preprocess_base(train: pd.DataFrame, test: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. HIERARCHICAL BIAS CORRECTION
-# ─────────────────────────────────────────────────────────────────────────────
-def get_hierarchical_bias(val_m: pd.DataFrame, geohashes: list) -> pd.Series:
-    """
-    Computes geohash-specific bias correction from morning data (val_m)
-    with hierarchical fallbacks for geohashes missing from the morning data.
-    """
-    val_m = val_m.copy()
-    val_m['bias'] = val_m['demand'] - val_m['pred_base_B']
-    
-    bias_geo = val_m.groupby('geohash')['bias'].mean()
-    
-    val_m['geohash_5'] = val_m['geohash'].str[:5]
-    bias_g5 = val_m.groupby('geohash_5')['bias'].mean()
-    
-    val_m['geohash_4'] = val_m['geohash'].str[:4]
-    bias_g4 = val_m.groupby('geohash_4')['bias'].mean()
-    
-    global_bias = val_m['bias'].mean()
-    
-    lookup = {}
-    for g in geohashes:
-        if g in bias_geo:
-            lookup[g] = bias_geo[g]
-        elif g[:5] in bias_g5:
-            lookup[g] = bias_g5[g[:5]]
-        elif g[:4] in bias_g4:
-            lookup[g] = bias_g4[g[:4]]
-        else:
-            lookup[g] = global_bias
-            
-    return pd.Series(lookup)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 5. MAIN PIPELINE
+# 4. MAIN PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     t0 = time.time()
@@ -157,119 +122,79 @@ def main():
     # Base Preprocessing
     train, test = preprocess_base(train, test)
 
-    # Split train set into Day 48 (base training) and Day 49 (morning overlap)
-    trn_48 = train[train["day"] == 48].copy()
-    val    = train[train["day"] == 49].copy()
+    # Create Geohash prefix features
+    train['geohash_4'] = train['geohash'].str[:4]
+    train['geohash_5'] = train['geohash'].str[:5]
+    test['geohash_4']  = test['geohash'].str[:4]
+    test['geohash_5']  = test['geohash'].str[:5]
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 6. LAG FEATURE GENERATION
-    # ─────────────────────────────────────────────────────────────────────────
-    print("\n" + "=" * 72)
-    print("  CREATING PIVOT-BASED LAG FEATURES")
-    print("=" * 72)
-    
-    piv_48 = trn_48.pivot(index='geohash', columns='minutes_from_midnight', values='demand')
-    all_geohashes = list(set(train['geohash'].unique()).union(test['geohash'].unique()))
-    all_minutes = list(range(0, 1440, 15))
-    piv_48 = piv_48.reindex(index=all_geohashes, columns=all_minutes)
-    
-    # Interpolate time-wise and fill any completely unseen geohashes
-    piv_48_filled = piv_48.interpolate(method='linear', axis=1, limit_direction='both')
-    global_mean_48 = trn_48['demand'].mean()
-    piv_48_filled = piv_48_filled.fillna(global_mean_48)
-
-    def add_lags(df):
-        lags = {}
-        for offset in [-60, -45, -30, -15, 0, 15, 30, 45, 60]:
-            col_name = f"lag_1d_{offset}m"
-            geohashes = df['geohash'].values
-            minutes = df['minutes_from_midnight'].values
-            shifted_minutes = (minutes + offset) % 1440
-            
-            row_idx = piv_48_filled.index.get_indexer(geohashes)
-            col_idx = piv_48_filled.columns.get_indexer(shifted_minutes)
-            values = piv_48_filled.values[row_idx, col_idx]
-            lags[col_name] = values
-            
-        lag_df = pd.DataFrame(lags, index=df.index)
-        df = pd.concat([df, lag_df], axis=1)
-        
-        # Add summary statistics
-        lag_cols = [f"lag_1d_{offset}m" for offset in [-60, -45, -30, -15, 0, 15, 30, 45, 60]]
-        df['lag_1d_mean'] = df[lag_cols].mean(axis=1)
-        df['lag_1d_std'] = df[lag_cols].std(axis=1)
-        df['lag_1d_min'] = df[lag_cols].min(axis=1)
-        df['lag_1d_max'] = df[lag_cols].max(axis=1)
-        return df
-
-    val  = add_lags(val)
-    test = add_lags(test)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # 7. SMOOTHED TARGET ENCODING (ROAD TYPE & WEATHER)
+    # 5. GEOGRAPHIC MORNING MEAN FEATURE (0:00 to 2:00)
     # ─────────────────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
-    print("  TARGET ENCODING CATEGORICALS")
+    print("  CREATING MORNING MEAN FEATURES")
     print("=" * 72)
     
-    def target_encode(train_df, val_df, test_df, col, target='demand', smoothing=20):
+    # Morning data from train.csv (both Day 48 and Day 49 morning exist in train)
+    morning_data = train[train['minutes_from_midnight'] <= 120]
+    geo_morning_stats = morning_data.groupby(['day', 'geohash'])['demand'].mean().reset_index().rename(columns={'demand': 'geo_morning_mean'})
+
+    train = train.merge(geo_morning_stats, on=['day', 'geohash'], how='left')
+    test  = test.merge(geo_morning_stats, on=['day', 'geohash'], how='left')
+
+    # Fill missing morning mean using the global morning mean of that day
+    global_morning_mean = morning_data.groupby('day')['demand'].mean().to_dict()
+    
+    train['geo_morning_mean'] = train.apply(
+        lambda r: r['geo_morning_mean'] if not pd.isna(r['geo_morning_mean']) else global_morning_mean.get(r['day'], 0.08), 
+        axis=1
+    )
+    test['geo_morning_mean'] = test.apply(
+        lambda r: r['geo_morning_mean'] if not pd.isna(r['geo_morning_mean']) else global_morning_mean.get(r['day'], 0.08), 
+        axis=1
+    )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 6. TIME-SERIES VALIDATION SPLIT
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  TIME-SERIES VALIDATION SPLIT")
+    print("=" * 72)
+    
+    trn_val = train[train["day"] == 48].copy()
+    val_val = train[train["day"] == 49].copy()
+
+    # Target encode for the validation run
+    def target_encode(train_df, val_df, col, target='demand', smoothing=20):
         global_mean = train_df[target].mean()
         stats = train_df.groupby(col)[target].agg(['mean', 'count'])
         smooth = (stats['count'] * stats['mean'] + smoothing * global_mean) / (stats['count'] + smoothing)
         train_df[f'{col}_te'] = train_df[col].map(smooth).fillna(global_mean)
         val_df[f'{col}_te'] = val_df[col].map(smooth).fillna(global_mean)
-        test_df[f'{col}_te'] = test_df[col].map(smooth).fillna(global_mean)
 
-    for col in ['RoadType', 'Weather']:
-        target_encode(trn_48, val, test, col)
+    for col in ['RoadType', 'Weather', 'geohash_4', 'geohash_5']:
+        target_encode(trn_val, val_val, col)
 
-    # Define Feature Sets
-    lag_cols = [f"lag_1d_{offset}m" for offset in [-60, -45, -30, -15, 0, 15, 30, 45, 60]]
-    
-    features_A = [
+    # Features list
+    features = [
         "latitude", "longitude",
         "hour", "minute", "minutes_from_midnight",
         "time_sin", "time_cos",
         "NumberofLanes", "LargeVehicles", "Landmarks",
         "Temperature",
         "RoadType_te", "Weather_te",
-        "lag_1d_mean", "lag_1d_std", "lag_1d_min", "lag_1d_max"
-    ] + lag_cols
-
-    features_B = [
-        "latitude", "longitude",
-        "hour", "minute", "minutes_from_midnight",
-        "time_sin", "time_cos",
-        "NumberofLanes", "LargeVehicles", "Landmarks",
-        "Temperature",
-        "RoadType_te", "Weather_te"
+        "geohash_4_te", "geohash_5_te",
+        "geo_morning_mean"
     ]
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # 8. TRAINING MODEL A (DAY 49 MORNING + LAG FEATURES)
-    # ─────────────────────────────────────────────────────────────────────────
-    print("\n" + "=" * 72)
-    print("  TRAINING MODEL A (DAY 49 MORNING)")
-    print("=" * 72)
+    X_trn = trn_val[features]
+    y_trn = trn_val["demand"]
+    X_val = val_val[features]
+    y_val = val_val["demand"]
 
-    cb_A = CatBoostRegressor(
-        iterations=800,
-        learning_rate=0.03,
-        depth=6,
-        l2_leaf_reg=5.0,
-        bootstrap_type="Bernoulli",
-        subsample=0.8,
-        random_strength=1.5,
-        min_data_in_leaf=10,
-        task_type="GPU",
-        devices="0",
-        random_seed=42,
-        verbose=0
-    )
-    cb_A.fit(val[features_A], val["demand"])
-
-    lgb_A = lgb.LGBMRegressor(
-        n_estimators=800,
+    # Fit validation LightGBM to find optimal iterations
+    lgb_val = lgb.LGBMRegressor(
+        n_estimators=1500,
         learning_rate=0.03,
         max_depth=6,
         num_leaves=63,
@@ -280,17 +205,74 @@ def main():
         random_state=42,
         verbose=-1
     )
-    lgb_A.fit(val[features_A], val["demand"])
+    lgb_val.fit(
+        X_trn, y_trn,
+        eval_set=[(X_val, y_val)],
+        callbacks=[lgb.early_stopping(50, verbose=False)]
+    )
+    best_iter_lgb = lgb_val.best_iteration_
+    print(f"  LightGBM best iteration: {best_iter_lgb} (Val R2 = {r2_score(y_val, lgb_val.predict(X_val)):.6f})")
+
+    # Fit validation CatBoost to find optimal iterations
+    cb_val = CatBoostRegressor(
+        iterations=1500,
+        learning_rate=0.03,
+        depth=6,
+        l2_leaf_reg=5.0,
+        bootstrap_type="Bernoulli",
+        subsample=0.8,
+        random_strength=1.5,
+        min_data_in_leaf=30,
+        early_stopping_rounds=50,
+        task_type="GPU",
+        devices="0",
+        random_seed=42,
+        verbose=0
+    )
+    cb_val.fit(X_trn, y_trn, eval_set=(X_val, y_val), use_best_model=True)
+    best_iter_cb = cb_val.get_best_iteration()
+    print(f"  CatBoost best iteration: {best_iter_cb} (Val R2 = {r2_score(y_val, cb_val.predict(X_val)):.6f})")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 9. TRAINING MODEL B (DAY 48 + HIERARCHICAL BIAS CORRECTION)
+    # 7. FINAL MODEL RETRAINING ON ENTIRE DATASET
     # ─────────────────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
-    print("  TRAINING MODEL B (DAY 48)")
+    print("  RETRAINING FINAL MODELS ON ENTIRE DATASET")
     print("=" * 72)
 
-    cb_B = CatBoostRegressor(
-        iterations=1200,
+    # Compute target encodings on the entire training set (Day 48 + Day 49 morning)
+    def target_encode_full(train_df, test_df, col, target='demand', smoothing=20):
+        global_mean = train_df[target].mean()
+        stats = train_df.groupby(col)[target].agg(['mean', 'count'])
+        smooth = (stats['count'] * stats['mean'] + smoothing * global_mean) / (stats['count'] + smoothing)
+        train_df[f'{col}_te'] = train_df[col].map(smooth).fillna(global_mean)
+        test_df[f'{col}_te'] = test_df[col].map(smooth).fillna(global_mean)
+
+    for col in ['RoadType', 'Weather', 'geohash_4', 'geohash_5']:
+        target_encode_full(train, test, col)
+
+    X_train_full = train[features]
+    y_train_full = train["demand"]
+    X_test = test[features]
+
+    # Retrain final LightGBM model
+    lgb_final = lgb.LGBMRegressor(
+        n_estimators=best_iter_lgb,
+        learning_rate=0.03,
+        max_depth=6,
+        num_leaves=63,
+        colsample_bytree=0.7,
+        subsample=0.8,
+        subsample_freq=1,
+        device='gpu',
+        random_state=42,
+        verbose=-1
+    )
+    lgb_final.fit(X_train_full, y_train_full)
+
+    # Retrain final CatBoost model
+    cb_final = CatBoostRegressor(
+        iterations=best_iter_cb,
         learning_rate=0.03,
         depth=6,
         l2_leaf_reg=5.0,
@@ -303,65 +285,31 @@ def main():
         random_seed=42,
         verbose=0
     )
-    cb_B.fit(trn_48[features_B], trn_48["demand"])
-
-    lgb_B = lgb.LGBMRegressor(
-        n_estimators=1200,
-        learning_rate=0.03,
-        max_depth=6,
-        num_leaves=63,
-        colsample_bytree=0.7,
-        subsample=0.8,
-        subsample_freq=1,
-        device='gpu',
-        random_state=42,
-        verbose=-1
-    )
-    lgb_B.fit(trn_48[features_B], trn_48["demand"])
+    cb_final.fit(X_train_full, y_train_full)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 10. COMPUTE HIERARCHICAL BIAS MAP
-    # ─────────────────────────────────────────────────────────────────────────
-    # Predict base B on val
-    pred_base_B_cb = cb_B.predict(val[features_B])
-    pred_base_B_lgb = lgb_B.predict(val[features_B])
-    val['pred_base_B'] = 0.5 * pred_base_B_cb + 0.5 * pred_base_B_lgb
-
-    bias_map = get_hierarchical_bias(val, test['geohash'].unique())
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # 11. GENERATE FINAL PREDICTIONS ON TEST SET
+    # 8. PREDICTIONS AND BLENDING
     # ─────────────────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
     print("  GENERATING PREDICTIONS")
     print("=" * 72)
 
-    # Predict Model A
-    pred_cb_A = cb_A.predict(test[features_A])
-    pred_lgb_A = lgb_A.predict(test[features_A])
-    pred_A = 0.5 * pred_cb_A + 0.5 * pred_lgb_A
+    pred_lgb = lgb_final.predict(X_test)
+    pred_cb  = cb_final.predict(X_test)
 
-    # Predict Model B and Apply Bias Correction
-    pred_base_B_cb_test = cb_B.predict(test[features_B])
-    pred_base_B_lgb_test = lgb_B.predict(test[features_B])
-    pred_base_B_test = 0.5 * pred_base_B_cb_test + 0.5 * pred_base_B_lgb_test
-    
-    pred_B = pred_base_B_test + test['geohash'].map(bias_map).fillna(0.0)
-    pred_B = np.clip(pred_B, 0.0, None)
-
-    # Final Ensemble Blend (0.60 Model A + 0.40 Model B)
-    pred_final = 0.60 * pred_A + 0.40 * pred_B
+    # Final Ensemble Blend (90% LightGBM + 10% CatBoost)
+    pred_final = 0.90 * pred_lgb + 0.10 * pred_cb
     pred_final = np.clip(pred_final, 0.0, None)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 12. GENERATE AND VALIDATE SUBMISSION FILE
+    # 9. VALIDATION AND SUBMISSION
     # ─────────────────────────────────────────────────────────────────────────
     sub = pd.DataFrame({
         "Index":  test["Index"].values,
         "demand": pred_final,
     })
 
-    # Assertions
+    # Validate shape and column names
     assert list(sub.columns) == list(sample_sub.columns), (
         f"Column mismatch: {list(sub.columns)} vs {list(sample_sub.columns)}"
     )
