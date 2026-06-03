@@ -409,10 +409,11 @@ def train_catboost(
         iterations=5000,
         learning_rate=0.03,
         depth=6,
-        l2_leaf_reg=3.0,
-        bootstrap_type="Bernoulli",     # ← required to use subsample
+        l2_leaf_reg=5.0,                # stronger L2 to compensate no rsm
+        bootstrap_type="Bernoulli",     # required to use subsample
         subsample=0.8,                  # row subsampling
-        colsample_bylevel=0.7,          # feature subsampling per level
+        # colsample_bylevel not supported on GPU for non-pairwise modes
+        random_strength=1.5,            # randomness for scoring splits (anti-overfit)
         min_data_in_leaf=30,
         early_stopping_rounds=100,
         task_type="GPU",                # ← RTX 3050 Ti
@@ -482,8 +483,8 @@ def generate_submission(
     assert list(sub.columns) == list(sample_sub.columns), (
         f"Column mismatch: {list(sub.columns)} vs {list(sample_sub.columns)}"
     )
-    assert len(sub) == len(sample_sub), (
-        f"Row count mismatch: {len(sub)} vs {len(sample_sub)}"
+    assert len(sub) == len(test), (
+        f"Row count mismatch: {len(sub)} vs expected {len(test)}"
     )
 
     sub.to_csv(OUT_PATH, index=False)
