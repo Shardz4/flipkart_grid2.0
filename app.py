@@ -1,7 +1,7 @@
 """
 ===================================================================================
   Flipkart Grid 2.0 — Spatio-Temporal Traffic Demand Prediction
-  End-to-End Improved Pipeline (LightGBM + CatBoost Ensemble, GPU-accelerated)
+  Difference Target Pipeline (LightGBM + CatBoost Ensemble, GPU-accelerated)
 ===================================================================================
   Metric  : R² (coefficient of determination)
   Hardware: NVIDIA RTX 3050 Ti (4 GB VRAM)
@@ -46,7 +46,7 @@ def decode_geohash_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. CYCLICAL TEMPORAL ENCODING
+# 2. CYCLICAL TEMPORAL ENCODING & INTERACTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 def encode_time_features(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -99,6 +99,13 @@ def preprocess_base(train: pd.DataFrame, test: pd.DataFrame):
         df["Landmarks"]     = df["Landmarks"].map({"No": 0, "Yes": 1}).fillna(0).astype("int8")
         df["RoadType"]      = df["RoadType"].fillna("Unknown")
 
+        # Interaction features
+        df["temp_x_hour"] = df["Temperature"] * df["hour"]
+        df["temp_x_lanes"] = df["Temperature"] * df["NumberofLanes"]
+        df["lat_x_time_sin"] = df["latitude"] * df["time_sin"]
+        df["lon_x_time_cos"] = df["longitude"] * df["time_cos"]
+        df["lane_large_vehicle"] = df["NumberofLanes"] * df["LargeVehicles"]
+
     return train, test
 
 
@@ -143,17 +150,23 @@ def main():
     morning_data = train[train['minutes_from_midnight'] <= 120]
     geo_morning_stats = morning_data.groupby(['day', 'geohash'])['demand'].mean().reset_index().rename(columns={'demand': 'geo_morning_mean'})
 
-    trn_48 = trn_48.merge(geo_morning_stats[geo_morning_stats['day'] == 48][['geohash', 'geo_morning_mean']], on='geohash', how='left')
-    val_49 = val_49.merge(geo_morning_stats[geo_morning_stats['day'] == 49][['geohash', 'geo_morning_mean']], on='geohash', how='left')
-    test   = test.merge(geo_morning_stats[geo_morning_stats['day'] == 49][['geohash', 'geo_morning_mean']], on='geohash', how='left')
+    train = train.merge(geo_morning_stats, on=['day', 'geohash'], how='left')
+    test  = test.merge(geo_morning_stats, on=['day', 'geohash'], how='left')
 
-    # Fill missing morning mean using the global morning mean of that day
+    # Fill missing morning mean using the global morning mean of the corresponding day
     global_morning_mean_48 = morning_data[morning_data['day'] == 48]['demand'].mean()
     global_morning_mean_49 = morning_data[morning_data['day'] == 49]['demand'].mean()
     
-    trn_48['geo_morning_mean'] = trn_48['geo_morning_mean'].fillna(global_morning_mean_48)
-    val_49['geo_morning_mean'] = val_49['geo_morning_mean'].fillna(global_morning_mean_49)
-    test['geo_morning_mean']   = test['geo_morning_mean'].fillna(global_morning_mean_49)
+    train['geo_morning_mean'] = train['geo_morning_mean'].fillna(
+        train['day'].map({48: global_morning_mean_48, 49: global_morning_mean_49})
+    )
+    test['geo_morning_mean'] = test['geo_morning_mean'].fillna(
+        test['day'].map({48: global_morning_mean_48, 49: global_morning_mean_49})
+    )
+
+    # Split morning means back into trn_48 and val_49
+    trn_48['geo_morning_mean'] = train[train['day'] == 48]['geo_morning_mean']
+    val_49['geo_morning_mean'] = train[train['day'] == 49]['geo_morning_mean']
 
     # ─────────────────────────────────────────────────────────────────────────
     # 6. HISTORICAL REFERENCE STABLE BASELINES (Day 48 daily mean, median, etc.)
@@ -169,14 +182,17 @@ def main():
         geo_demand_max='max'
     ).reset_index()
 
-    trn_48 = trn_48.merge(geo_stats_48, on='geohash', how='left')
-    val_49 = val_49.merge(geo_stats_48, on='geohash', how='left')
-    test   = test.merge(geo_stats_48, on='geohash', how='left')
+    train = train.merge(geo_stats_48, on='geohash', how='left')
+    test  = test.merge(geo_stats_48, on='geohash', how='left')
+
+    # Update splits
+    trn_48 = train[train["day"] == 48].copy()
+    val_49 = train[train["day"] == 49].copy()
 
     global_mean_48 = trn_48['demand'].mean()
     global_std_48 = trn_48['demand'].std()
     
-    for df in [trn_48, val_49, test]:
+    for df in [train, test, trn_48, val_49]:
         df['geo_demand_mean'] = df['geo_demand_mean'].fillna(global_mean_48)
         df['geo_demand_median'] = df['geo_demand_median'].fillna(global_mean_48)
         df['geo_demand_std'] = df['geo_demand_std'].fillna(global_std_48)
@@ -195,10 +211,12 @@ def main():
         smooth = (stats['count'] * stats['mean'] + smoothing * global_mean) / (stats['count'] + smoothing)
         train_df[f'{col}_te'] = train_df[col].map(smooth).fillna(global_mean)
         val_df[f'{col}_te'] = val_df[col].map(smooth).fillna(global_mean)
-        test_df[f'{col}_te'] = test_df[col].map(smooth).fillna(global_mean)
+        if test_df is not None:
+            test_df[f'{col}_te'] = test_df[col].map(smooth).fillna(global_mean)
 
+    # Encoding for the validation run (using trn_48 statistics)
     for col in ['RoadType', 'Weather', 'geohash_4', 'geohash_5']:
-        target_encode(trn_48, val_49, test, col)
+        target_encode(trn_48, val_49, None, col)
 
     # Features list
     features = [
@@ -210,24 +228,26 @@ def main():
         "RoadType_te", "Weather_te",
         "geohash_4_te", "geohash_5_te",
         "geo_demand_mean", "geo_demand_median", "geo_demand_std", "geo_demand_max",
-        "geo_morning_mean"
+        "geo_morning_mean",
+        "temp_x_hour", "temp_x_lanes", "lat_x_time_sin", "lon_x_time_cos", "lane_large_vehicle"
     ]
 
+    # Target variable for modeling is residual difference: demand - geo_morning_mean
     X_trn = trn_48[features]
-    y_trn = trn_48["demand"]
+    y_trn = trn_48["demand"] - trn_48["geo_morning_mean"]
     X_val = val_49[features]
-    y_val = val_49["demand"]
+    y_val = val_49["demand"] - val_49["geo_morning_mean"]
 
     # ─────────────────────────────────────────────────────────────────────────
     # 8. TRAINING MODEL WITH TIME-SERIES VALIDATION SPLIT
     # ─────────────────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
-    print("  TIME-SERIES VALIDATION SPLIT")
+    print("  TIME-SERIES VALIDATION SPLIT (Residual Modeling)")
     print("=" * 72)
 
     # Fit validation LightGBM to find optimal iterations
     lgb_val = lgb.LGBMRegressor(
-        n_estimators=2000,
+        n_estimators=3000,
         learning_rate=0.03,
         max_depth=6,
         num_leaves=63,
@@ -244,11 +264,16 @@ def main():
         callbacks=[lgb.early_stopping(50, verbose=False)]
     )
     best_iter_lgb = lgb_val.best_iteration_
-    print(f"  LightGBM best iteration: {best_iter_lgb} (Val R2 = {r2_score(y_val, lgb_val.predict(X_val)):.6f})")
+    
+    # Validation LightGBM reconstructed R2
+    pred_val_lgb_diff = lgb_val.predict(X_val)
+    pred_val_lgb = np.clip(pred_val_lgb_diff + val_49["geo_morning_mean"].values, 0.0, None)
+    val_r2_lgb = r2_score(val_49["demand"], pred_val_lgb)
+    print(f"  LightGBM best iteration: {best_iter_lgb} (Val R2 = {val_r2_lgb:.6f})")
 
     # Fit validation CatBoost to find optimal iterations
     cb_val = CatBoostRegressor(
-        iterations=2000,
+        iterations=3000,
         learning_rate=0.03,
         depth=6,
         l2_leaf_reg=5.0,
@@ -264,16 +289,33 @@ def main():
     )
     cb_val.fit(X_trn, y_trn, eval_set=(X_val, y_val), use_best_model=True)
     best_iter_cb = cb_val.get_best_iteration()
-    print(f"  CatBoost best iteration: {best_iter_cb} (Val R2 = {r2_score(y_val, cb_val.predict(X_val)):.6f})")
+    
+    # Validation CatBoost reconstructed R2
+    pred_val_cb_diff = cb_val.predict(X_val)
+    pred_val_cb = np.clip(pred_val_cb_diff + val_49["geo_morning_mean"].values, 0.0, None)
+    val_r2_cb = r2_score(val_49["demand"], pred_val_cb)
+    print(f"  CatBoost best iteration: {best_iter_cb} (Val R2 = {val_r2_cb:.6f})")
+
+    # Ensemble Val R2
+    pred_val_ensemble = 0.50 * pred_val_lgb + 0.50 * pred_val_cb
+    val_r2_ensemble = r2_score(val_49["demand"], pred_val_ensemble)
+    print(f"  Ensemble (50/50 Blend) Val R2 = {val_r2_ensemble:.6f}")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 9. RETRAINING FINAL MODELS ON HISTORICAL DATASET
+    # 9. RETRAINING FINAL MODELS ON ENTIRE DATASET
     # ─────────────────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
-    print("  RETRAINING FINAL MODELS")
+    print("  RETRAINING FINAL MODELS ON ENTIRE DATASET")
     print("=" * 72)
 
-    # Retrain final LightGBM model on the entire Day 48 dataset
+    # Compute target encodings on the entire training set (Day 48 + Day 49 morning)
+    for col in ['RoadType', 'Weather', 'geohash_4', 'geohash_5']:
+        target_encode(train, train, test, col)
+
+    X_train_full = train[features]
+    y_train_full = train["demand"] - train["geo_morning_mean"]
+
+    # Retrain final LightGBM model
     lgb_final = lgb.LGBMRegressor(
         n_estimators=best_iter_lgb,
         learning_rate=0.03,
@@ -286,9 +328,9 @@ def main():
         random_state=42,
         verbose=-1
     )
-    lgb_final.fit(X_trn, y_trn)
+    lgb_final.fit(X_train_full, y_train_full)
 
-    # Retrain final CatBoost model on the entire Day 48 dataset
+    # Retrain final CatBoost model
     cb_final = CatBoostRegressor(
         iterations=best_iter_cb,
         learning_rate=0.03,
@@ -303,7 +345,7 @@ def main():
         random_seed=42,
         verbose=0
     )
-    cb_final.fit(X_trn, y_trn)
+    cb_final.fit(X_train_full, y_train_full)
 
     # ─────────────────────────────────────────────────────────────────────────
     # 10. GENERATE FINAL PREDICTIONS ON TEST SET
@@ -314,11 +356,14 @@ def main():
 
     X_test = test[features]
 
-    pred_lgb = lgb_final.predict(X_test)
-    pred_cb  = cb_final.predict(X_test)
+    pred_diff_lgb = lgb_final.predict(X_test)
+    pred_diff_cb  = cb_final.predict(X_test)
 
-    # Final Ensemble Blend (90% LightGBM + 10% CatBoost)
-    pred_final = 0.90 * pred_lgb + 0.10 * pred_cb
+    # Final Ensemble Blend (50% LightGBM + 50% CatBoost)
+    pred_diff_final = 0.50 * pred_diff_lgb + 0.50 * pred_diff_cb
+    
+    # Reconstruct final demand by adding back the corresponding Day 49 morning mean
+    pred_final = pred_diff_final + test['geo_morning_mean'].values
     pred_final = np.clip(pred_final, 0.0, None)
 
     # ─────────────────────────────────────────────────────────────────────────
