@@ -128,6 +128,10 @@ def main():
     test['geohash_4']  = test['geohash'].str[:4]
     test['geohash_5']  = test['geohash'].str[:5]
 
+    # Split train set into Day 48 and Day 49 morning
+    trn_48 = train[train["day"] == 48].copy()
+    val_49 = train[train["day"] == 49].copy()
+
     # ─────────────────────────────────────────────────────────────────────────
     # 5. GEOGRAPHIC MORNING MEAN FEATURE (0:00 to 2:00)
     # ─────────────────────────────────────────────────────────────────────────
@@ -139,41 +143,62 @@ def main():
     morning_data = train[train['minutes_from_midnight'] <= 120]
     geo_morning_stats = morning_data.groupby(['day', 'geohash'])['demand'].mean().reset_index().rename(columns={'demand': 'geo_morning_mean'})
 
-    train = train.merge(geo_morning_stats, on=['day', 'geohash'], how='left')
-    test  = test.merge(geo_morning_stats, on=['day', 'geohash'], how='left')
+    trn_48 = trn_48.merge(geo_morning_stats[geo_morning_stats['day'] == 48][['geohash', 'geo_morning_mean']], on='geohash', how='left')
+    val_49 = val_49.merge(geo_morning_stats[geo_morning_stats['day'] == 49][['geohash', 'geo_morning_mean']], on='geohash', how='left')
+    test   = test.merge(geo_morning_stats[geo_morning_stats['day'] == 49][['geohash', 'geo_morning_mean']], on='geohash', how='left')
 
     # Fill missing morning mean using the global morning mean of that day
-    global_morning_mean = morning_data.groupby('day')['demand'].mean().to_dict()
+    global_morning_mean_48 = morning_data[morning_data['day'] == 48]['demand'].mean()
+    global_morning_mean_49 = morning_data[morning_data['day'] == 49]['demand'].mean()
     
-    train['geo_morning_mean'] = train.apply(
-        lambda r: r['geo_morning_mean'] if not pd.isna(r['geo_morning_mean']) else global_morning_mean.get(r['day'], 0.08), 
-        axis=1
-    )
-    test['geo_morning_mean'] = test.apply(
-        lambda r: r['geo_morning_mean'] if not pd.isna(r['geo_morning_mean']) else global_morning_mean.get(r['day'], 0.08), 
-        axis=1
-    )
+    trn_48['geo_morning_mean'] = trn_48['geo_morning_mean'].fillna(global_morning_mean_48)
+    val_49['geo_morning_mean'] = val_49['geo_morning_mean'].fillna(global_morning_mean_49)
+    test['geo_morning_mean']   = test['geo_morning_mean'].fillna(global_morning_mean_49)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 6. TIME-SERIES VALIDATION SPLIT
+    # 6. HISTORICAL REFERENCE STABLE BASELINES (Day 48 daily mean, median, etc.)
     # ─────────────────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
-    print("  TIME-SERIES VALIDATION SPLIT")
+    print("  CREATING STABLE HISTORICAL BASELINES")
     print("=" * 72)
     
-    trn_val = train[train["day"] == 48].copy()
-    val_val = train[train["day"] == 49].copy()
+    geo_stats_48 = trn_48.groupby('geohash')['demand'].agg(
+        geo_demand_mean='mean',
+        geo_demand_median='median',
+        geo_demand_std='std',
+        geo_demand_max='max'
+    ).reset_index()
 
-    # Target encode for the validation run
-    def target_encode(train_df, val_df, col, target='demand', smoothing=20):
+    trn_48 = trn_48.merge(geo_stats_48, on='geohash', how='left')
+    val_49 = val_49.merge(geo_stats_48, on='geohash', how='left')
+    test   = test.merge(geo_stats_48, on='geohash', how='left')
+
+    global_mean_48 = trn_48['demand'].mean()
+    global_std_48 = trn_48['demand'].std()
+    
+    for df in [trn_48, val_49, test]:
+        df['geo_demand_mean'] = df['geo_demand_mean'].fillna(global_mean_48)
+        df['geo_demand_median'] = df['geo_demand_median'].fillna(global_mean_48)
+        df['geo_demand_std'] = df['geo_demand_std'].fillna(global_std_48)
+        df['geo_demand_max'] = df['geo_demand_max'].fillna(global_mean_48)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 7. TARGET ENCODING
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  TARGET ENCODING CATEGORICALS")
+    print("=" * 72)
+    
+    def target_encode(train_df, val_df, test_df, col, target='demand', smoothing=20):
         global_mean = train_df[target].mean()
         stats = train_df.groupby(col)[target].agg(['mean', 'count'])
         smooth = (stats['count'] * stats['mean'] + smoothing * global_mean) / (stats['count'] + smoothing)
         train_df[f'{col}_te'] = train_df[col].map(smooth).fillna(global_mean)
         val_df[f'{col}_te'] = val_df[col].map(smooth).fillna(global_mean)
+        test_df[f'{col}_te'] = test_df[col].map(smooth).fillna(global_mean)
 
     for col in ['RoadType', 'Weather', 'geohash_4', 'geohash_5']:
-        target_encode(trn_val, val_val, col)
+        target_encode(trn_48, val_49, test, col)
 
     # Features list
     features = [
@@ -184,17 +209,25 @@ def main():
         "Temperature",
         "RoadType_te", "Weather_te",
         "geohash_4_te", "geohash_5_te",
+        "geo_demand_mean", "geo_demand_median", "geo_demand_std", "geo_demand_max",
         "geo_morning_mean"
     ]
 
-    X_trn = trn_val[features]
-    y_trn = trn_val["demand"]
-    X_val = val_val[features]
-    y_val = val_val["demand"]
+    X_trn = trn_48[features]
+    y_trn = trn_48["demand"]
+    X_val = val_49[features]
+    y_val = val_49["demand"]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 8. TRAINING MODEL WITH TIME-SERIES VALIDATION SPLIT
+    # ─────────────────────────────────────────────────────────────────────────
+    print("\n" + "=" * 72)
+    print("  TIME-SERIES VALIDATION SPLIT")
+    print("=" * 72)
 
     # Fit validation LightGBM to find optimal iterations
     lgb_val = lgb.LGBMRegressor(
-        n_estimators=1500,
+        n_estimators=2000,
         learning_rate=0.03,
         max_depth=6,
         num_leaves=63,
@@ -215,7 +248,7 @@ def main():
 
     # Fit validation CatBoost to find optimal iterations
     cb_val = CatBoostRegressor(
-        iterations=1500,
+        iterations=2000,
         learning_rate=0.03,
         depth=6,
         l2_leaf_reg=5.0,
@@ -234,28 +267,13 @@ def main():
     print(f"  CatBoost best iteration: {best_iter_cb} (Val R2 = {r2_score(y_val, cb_val.predict(X_val)):.6f})")
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 7. FINAL MODEL RETRAINING ON ENTIRE DATASET
+    # 9. RETRAINING FINAL MODELS ON HISTORICAL DATASET
     # ─────────────────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
-    print("  RETRAINING FINAL MODELS ON ENTIRE DATASET")
+    print("  RETRAINING FINAL MODELS")
     print("=" * 72)
 
-    # Compute target encodings on the entire training set (Day 48 + Day 49 morning)
-    def target_encode_full(train_df, test_df, col, target='demand', smoothing=20):
-        global_mean = train_df[target].mean()
-        stats = train_df.groupby(col)[target].agg(['mean', 'count'])
-        smooth = (stats['count'] * stats['mean'] + smoothing * global_mean) / (stats['count'] + smoothing)
-        train_df[f'{col}_te'] = train_df[col].map(smooth).fillna(global_mean)
-        test_df[f'{col}_te'] = test_df[col].map(smooth).fillna(global_mean)
-
-    for col in ['RoadType', 'Weather', 'geohash_4', 'geohash_5']:
-        target_encode_full(train, test, col)
-
-    X_train_full = train[features]
-    y_train_full = train["demand"]
-    X_test = test[features]
-
-    # Retrain final LightGBM model
+    # Retrain final LightGBM model on the entire Day 48 dataset
     lgb_final = lgb.LGBMRegressor(
         n_estimators=best_iter_lgb,
         learning_rate=0.03,
@@ -268,9 +286,9 @@ def main():
         random_state=42,
         verbose=-1
     )
-    lgb_final.fit(X_train_full, y_train_full)
+    lgb_final.fit(X_trn, y_trn)
 
-    # Retrain final CatBoost model
+    # Retrain final CatBoost model on the entire Day 48 dataset
     cb_final = CatBoostRegressor(
         iterations=best_iter_cb,
         learning_rate=0.03,
@@ -285,14 +303,16 @@ def main():
         random_seed=42,
         verbose=0
     )
-    cb_final.fit(X_train_full, y_train_full)
+    cb_final.fit(X_trn, y_trn)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 8. PREDICTIONS AND BLENDING
+    # 10. GENERATE FINAL PREDICTIONS ON TEST SET
     # ─────────────────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
     print("  GENERATING PREDICTIONS")
     print("=" * 72)
+
+    X_test = test[features]
 
     pred_lgb = lgb_final.predict(X_test)
     pred_cb  = cb_final.predict(X_test)
@@ -302,7 +322,7 @@ def main():
     pred_final = np.clip(pred_final, 0.0, None)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # 9. VALIDATION AND SUBMISSION
+    # 11. VALIDATION AND SUBMISSION
     # ─────────────────────────────────────────────────────────────────────────
     sub = pd.DataFrame({
         "Index":  test["Index"].values,
