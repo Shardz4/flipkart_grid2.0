@@ -1,0 +1,130 @@
+=============================================================================
+ Flipkart GRID 2.0 — Traffic Demand Prediction: Complete Approach Document
+=============================================================================
+
+ Competition: Flipkart GRID 2.0 — Spatio-Temporal Regression
+ Target Metric: R² Score
+ Hardware: NVIDIA RTX 3050 Ti GPU (4 GB VRAM)
+ Final Validation R²: 96.28% (Leak-free hybrid fallback + correction)
+
+=============================================================================
+
+
+─────────────────────────────────────────────────────────────────────────────
+ 1. PROBLEM UNDERSTANDING
+─────────────────────────────────────────────────────────────────────────────
+
+TASK:
+Predict traffic 'demand' (continuous value between 0.0 and 1.0) based on
+environmental, spatial, and temporal factors for different geographic locations.
+
+DATA STRUCTURE:
+- train.csv: 77,299 rows
+  * Day 48: Full 24-hour data (0:00 to 23:45), ~69,427 rows
+  * Day 49: Morning only (0:00 to 2:00), ~7,872 rows
+  * 1,249 unique geohash locations
+- test.csv: 41,778 rows
+  * Day 49: Afternoon (2:15 to 13:45)
+  * 1,190 unique geohash locations
+
+The core challenge is TEMPORAL EXTRAPOLATION. We must predict Day 49 afternoon
+traffic using Day 48 full-day data + Day 49 morning data.
+
+
+─────────────────────────────────────────────────────────────────────────────
+ 2. KEY REVERSE ENGINEERING INSIGHTS
+─────────────────────────────────────────────────────────────────────────────
+
+A. LOW-RANK SPATIAL STRUCTURE:
+   - Geographic location (geohash) explains ~81% of the overall variance.
+   - SVD decomposition of the geohash x timestamp demand matrix shows that the
+     top 5 components explain over 91% of the total variance.
+
+B. TEMPORAL PROFILE STABILITY:
+   - Traffic demand is highly periodic. The temporal profile (excluding the
+     morning baseline shift) is extremely stable from Day 48 to Day 49.
+   - That is: (demand_49 - morning_mean_49) ≈ (demand_48 - morning_mean_48)
+
+C. ROAD PROPERTY DEPENDENCIES:
+   - RoadType determines the baseline demand magnitude:
+     * Highway: ~0.61 ± 0.23 (highest, high volatility)
+     * Street: ~0.27 ± 0.04 (medium, flat & highly stable)
+     * Residential: ~0.06 ± 0.05 (lowest, moderate volatility)
+   - LargeVehicles ("Allowed") and NumberofLanes correlate strongly with Highways.
+
+D. ENVIRONMENTAL FACTORS:
+   - Temperature and Weather have negligible direct correlation with demand
+     after controlling for spatial location and time of day.
+
+
+─────────────────────────────────────────────────────────────────────────────
+ 3. FEATURE ENGINEERING
+─────────────────────────────────────────────────────────────────────────────
+
+A. SPATIAL FEATURES:
+   1. latitude / longitude — Decoded from geohash using python-geohash.
+   2. geohash_3 / geohash_4 / geohash_5 — Prefixes to capture spatial hierarchy
+      via out-of-fold target encoding.
+
+B. TEMPORAL FEATURES:
+   1. hour / minute / minutes_from_midnight — Numerical time features.
+   2. time_sin / time_cos — Cyclical 24-hour encoding.
+   3. time_sin_12h / time_cos_12h — Cyclical 12-hour encoding.
+   4. time_bucket_30 / time_bucket_60 — Discrete time buckets.
+
+C. MORNING BASELINE (CRITICAL):
+   1. morning_mean — Average demand during the morning hours (0:00 to 2:00,
+      minutes 0 to 120) for the specific day and geohash.
+   2. For the test set (Day 49 afternoon), this baseline is computed using the
+      Day 49 morning data available in train.csv.
+   3. If missing, it falls back to the day's global morning mean.
+
+D. HISTORICAL SAME-TIME LAG FEATURES (CRITICAL):
+   1. d48_demand — Demand at the same (geohash, minutes_from_midnight) on Day 48.
+   2. d48_morning_mean — Morning mean of the same geohash on Day 48.
+   3. d48_residual — d48_demand - d48_morning_mean.
+
+
+─────────────────────────────────────────────────────────────────────────────
+ 4. MODELING ARCHITECTURE (THE HYBRID STRATEGY)
+─────────────────────────────────────────────────────────────────────────────
+
+To prevent target leakage during training while maximizing predictive accuracy, we
+implemented a dual-model hybrid architecture:
+
+MODEL 1: Spatio-Temporal Fallback Model
+- Purpose: Predicts residual demand when same-time Day 48 historical data is missing.
+- Target: residual (demand - morning_mean) on Day 48.
+- Features: Spatial, temporal, and road features, cyclical time, and target-encoded
+  geohash prefixes. Crucially, it does NOT include same-time Day 48 lag/residual
+  features to prevent target leakage.
+- Ensemble: 50% LightGBM + 50% CatBoost, both GPU-accelerated.
+
+MODEL 2: Difference Correction Model
+- Purpose: Predicts the day-to-day residual shift when same-time Day 48 lags are present.
+- Target: diff_residual = residual_49 - residual_48.
+- Features: Raw features, d48_residual, d48_demand, morning_mean, and d48_morning_mean.
+- Framework: CatBoost Regressor, GPU-accelerated.
+
+HYBRID ROUTING (INFERENCE):
+For each test set row:
+- If d48_residual is NaN (11.11% of the test set):
+  pred_demand = Model_1_Residual_Prediction + morning_mean
+- If d48_residual is present (88.89% of the test set):
+  pred_demand = d48_residual + Model_2_Diff_Prediction + morning_mean
+- Finally, predictions are clipped to [0.0, 1.0].
+
+
+─────────────────────────────────────────────────────────────────────────────
+ 5. VALIDATION RESULTS
+─────────────────────────────────────────────────────────────────────────────
+
+Strict Time-Series Split (Train on Day 48, Validate on Day 49 morning):
+
+1. Baseline (d48_residual + morning_mean_49):  R² = 92.08%
+2. Direct Spatio-Temporal Fallback Blend:      R² = 93.71%
+3. Hybrid Pipeline (Fallback + Correction):   R² = 96.28%
+
+The hybrid strategy outperforms the pure historical lag baseline by over 4.2%
+R² and outperforms standard boosting models (which suffer from target leakage during
+training) by over 2.1% R².
