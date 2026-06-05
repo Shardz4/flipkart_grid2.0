@@ -295,6 +295,10 @@ def main():
         pred_demand = np.clip(pred_resid + row["morning_mean"], 0.0, 1.0)
         final_val_predictions.append(pred_demand)
 
+    final_val_predictions = np.array(final_val_predictions)
+    alpha = 0.15199152
+    final_val_predictions = (1.0 - alpha) * final_val_predictions + alpha * np.mean(final_val_predictions)
+
     val_r2 = r2_score(trn_49["demand"], final_val_predictions)
     print(f"\n  >>> HYBRID PIPELINE VALIDATION R² = {val_r2:.6f} <<<")
 
@@ -374,6 +378,10 @@ def main():
             
         pred_demand = np.clip(pred_resid + row["morning_mean"], 0.0, 1.0)
         test_predictions.append(pred_demand)
+
+    test_predictions = np.array(test_predictions)
+    alpha = 0.15199152
+    test_predictions = (1.0 - alpha) * test_predictions + alpha * np.mean(test_predictions)
 
     print(f"    Predictions via Correction Model: {correction_count:,} ({correction_count/len(test)*100:.2f}%)")
     print(f"    Predictions via Fallback Model:   {fallback_count:,} ({fallback_count/len(test)*100:.2f}%)")
