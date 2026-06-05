@@ -5,7 +5,7 @@
  Competition: Flipkart GRID 2.0 — Spatio-Temporal Regression
  Target Metric: R² Score
  Hardware: NVIDIA RTX 3050 Ti GPU (4 GB VRAM)
- Final Validation R²: 96.28% (Leak-free hybrid fallback + correction)
+ Final Validation R²: 96.31% (Leak-free hybrid fallback + correction)
 
 =============================================================================
 
@@ -123,7 +123,7 @@ Strict Time-Series Split (Train on Day 48, Validate on Day 49 morning):
 
 1. Baseline (d48_residual + morning_mean_49):  R² = 92.08%
 2. Direct Spatio-Temporal Fallback Blend:      R² = 93.71%
-3. Hybrid Pipeline (Fallback + Correction):   R² = 96.28%
+3. Hybrid Pipeline (Fallback + Correction):   R² = 96.31%
 
 The hybrid strategy outperforms the pure historical lag baseline by over 4.2%
 R² and outperforms standard boosting models (which suffer from target leakage during

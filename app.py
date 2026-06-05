@@ -202,8 +202,8 @@ def main():
     lgb_params = {
         'n_estimators': 3000,
         'learning_rate': 0.02,
-        'max_depth': 8,
-        'num_leaves': 255,
+        'max_depth': 7,
+        'num_leaves': 127,
         'colsample_bytree': 0.8,
         'subsample': 0.8,
         'subsample_freq': 1,
@@ -227,8 +227,8 @@ def main():
     cb_params = {
         'iterations': 3000,
         'learning_rate': 0.03,
-        'depth': 8,
-        'l2_leaf_reg': 1.0,
+        'depth': 7,
+        'l2_leaf_reg': 3.0,
         'early_stopping_rounds': 100,
         'task_type': 'GPU',
         'devices': '0',
@@ -262,10 +262,10 @@ def main():
         X_va, y_va = X_corr.iloc[val_idx], y_corr.iloc[val_idx]
         
         model_cb_corr = CatBoostRegressor(
-            iterations=800,
+            iterations=400,
             learning_rate=0.05,
-            depth=8,
-            l2_leaf_reg=1.0,
+            depth=6,
+            l2_leaf_reg=5.0,
             task_type='GPU',
             devices='0',
             random_seed=42 + fold,
@@ -340,10 +340,10 @@ def main():
     X_test_corr = test[features_corr]
 
     final_cb_corr = CatBoostRegressor(
-        iterations=800,
+        iterations=400,
         learning_rate=0.05,
-        depth=8,
-        l2_leaf_reg=1.0,
+        depth=6,
+        l2_leaf_reg=5.0,
         task_type='GPU',
         devices='0',
         random_seed=42,
